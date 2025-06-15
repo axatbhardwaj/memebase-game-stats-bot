@@ -1,7 +1,7 @@
 [project]
 name = "memebase-game-stats-bot"
 version = "0.1.0"
-description = "Add your description here"
+description = "This is a telegram bot that fetches on-chain event statistics for the Memebase contract on the Base network. for past 24 hours for the addresses you provide."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
