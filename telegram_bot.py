@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio  # Added for running blocking function in thread
 import io  # For in-memory file-like objects
+import time  # Added for timestamped logging
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.constants import ParseMode  # Corrected import
 from telegram.helpers import escape_markdown  # Import the escape_markdown helper
@@ -131,10 +132,19 @@ async def ask_events_received(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
     """Processes event choices and fetches stats."""
+    user_id = update.effective_user.id if update.effective_user else "UnknownUser"
+    current_time_start_func = time.time()
+    logger.info(
+        f"User {user_id}: Entered ask_events_received at {current_time_start_func:.4f}"
+    )
+
     selected_event_choice_text = update.message.text
     addresses_to_investigate = context.user_data.get("addresses_to_investigate")
 
     if not addresses_to_investigate:
+        logger.warning(
+            f"User {user_id}: No addresses found in user_data in ask_events_received."
+        )
         msg = escape_markdown(
             "Something went wrong, I don't have the address(es). Please start over with /getstats.",
             version=2,
@@ -145,7 +155,7 @@ async def ask_events_received(
         return ConversationHandler.END
 
     logger.info(
-        f"Selected event choice for {addresses_to_investigate}: {selected_event_choice_text}"
+        f"User {user_id}: Selected event choice for {addresses_to_investigate}: {selected_event_choice_text}"
     )
 
     escaped_choice_for_fetching_msg = escape_markdown(
@@ -162,10 +172,19 @@ async def ask_events_received(
         "... Please wait, this may take a moment.", version=2
     )
     fetching_text = fetching_text_intro + fetching_text_choice + fetching_text_suffix
+
+    time_before_reply = time.time()
+    logger.info(
+        f"User {user_id}: About to send 'Fetching stats...' message at {time_before_reply:.4f}. Time since func start: {time_before_reply - current_time_start_func:.4f}s"
+    )
     await update.message.reply_text(
         fetching_text,
         reply_markup=ReplyKeyboardRemove(),
         parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    time_after_reply = time.time()
+    logger.info(
+        f"User {user_id}: Sent 'Fetching stats...' message at {time_after_reply:.4f}. Reply took: {time_after_reply - time_before_reply:.4f}s"
     )
 
     selected_event_keys = []
@@ -206,11 +225,19 @@ async def ask_events_received(
 
     try:
         # Run the blocking function in a separate thread
+        time_before_to_thread = time.time()
+        logger.info(
+            f"User {user_id}: Calling get_address_stats in a thread at {time_before_to_thread:.4f}. Time since func start: {time_before_to_thread - current_time_start_func:.4f}s"
+        )
         all_analysis_results, eth_to_usd_rate, errors = await asyncio.to_thread(
             get_address_stats,
             addresses_to_investigate,
             selected_event_keys,
             custom_rpc_urls=RPC_URLS,
+        )
+        time_after_to_thread = time.time()
+        logger.info(
+            f"User {user_id}: get_address_stats call (awaited) completed at {time_after_to_thread:.4f}. Duration in thread (from this perspective): {time_after_to_thread - time_before_to_thread:.4f}s"
         )
 
         response_message_parts = []
@@ -348,7 +375,7 @@ async def ask_events_received(
 
     except Exception as e:
         logger.error(
-            f"Error during stats fetching or processing for addresses: {addresses_to_investigate}: {e}",
+            f"User {user_id}: Error during stats fetching or processing for addresses: {addresses_to_investigate}: {e}",
             exc_info=True,
         )
         error_message_text = f"An unexpected error occurred while processing your request. Please try again later or contact support."
@@ -366,7 +393,10 @@ async def ask_events_received(
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the conversation."""
     user = update.message.from_user
-    logger.info("User %s canceled the conversation.", user.first_name)
+    user_id = user.id if user else "UnknownUser"
+    logger.info(
+        f"User {user_id} ({user.first_name if user else 'N/A'}) canceled the conversation."
+    )
     if "addresses_to_investigate" in context.user_data:
         del context.user_data["addresses_to_investigate"]
 
