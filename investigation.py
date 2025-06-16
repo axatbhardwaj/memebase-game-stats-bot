@@ -317,7 +317,7 @@ def fetch_eth_to_usd_rate():
 
 
 # Define the total range and chunk size based on the problem statement
-TOTAL_BLOCKS_TO_FETCH = 432000  # on base blockchain 1 day = 432000 blocks
+TOTAL_BLOCKS_TO_FETCH = 86400  # on base blockchain 1 day = 432000 blocks
 MAX_BLOCK_RANGE_PER_REQUEST = 500  # Alchemy's 500 block limit
 
 
