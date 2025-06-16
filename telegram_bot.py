@@ -41,7 +41,7 @@ RPC_URLS = [url.strip() for url in RPC_URLS_STR.split(",")] if RPC_URLS_STR else
 from investigation import get_address_stats, EVENT_CONFIGS
 
 # Conversation states
-ASK_ADDRESS, ASK_EVENTS = range(2)
+ASK_ADDRESS, ASK_EVENTS, ASK_DURATION = range(3)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -49,7 +49,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Welcome to the Memebase Game Stats Bot!\n\n"
         "This bot fetches on-chain event statistics for the Memebase contract on the Base network. "
         "It analyzes events such as Hearted, Collected, Summoned, Unleashed, and Purged.\n\n"
-        "📊 The data presented is for approximately the last 7 days of blockchain activity.\n\n"
+        "�� The data presented can be filtered for the last 1 to 7 days of blockchain activity.\n\n"
         "To get started, use the /getstats command. You can provide a single Ethereum address or multiple addresses separated by commas."
     )
     await update.message.reply_text(welcome_message)
@@ -131,7 +131,7 @@ async def ask_address_received(
 async def ask_events_received(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    """Processes event choices and fetches stats."""
+    """Stores event choices and asks for duration."""
     user_id = update.effective_user.id if update.effective_user else "UnknownUser"
     current_time_start_func = time.time()
     logger.info(
@@ -158,8 +158,144 @@ async def ask_events_received(
         f"User {user_id}: Selected event choice for {addresses_to_investigate}: {selected_event_choice_text}"
     )
 
+    selected_event_keys = []
+    if selected_event_choice_text.lower() == "all events":
+        selected_event_keys = list(EVENT_CONFIGS.keys())
+    else:
+        try:
+            key_from_choice = selected_event_choice_text.split(".")[0].strip()
+            if key_from_choice in EVENT_CONFIGS:
+                selected_event_keys = [key_from_choice]
+            else:
+                msg = escape_markdown(
+                    "Invalid event choice. Please try again or use /cancel.", version=2
+                )
+                await update.message.reply_text(
+                    msg,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=ReplyKeyboardRemove(),
+                )
+                # Clean up partial data before ending
+                if "addresses_to_investigate" in context.user_data:
+                    del context.user_data["addresses_to_investigate"]
+                return ConversationHandler.END
+        except Exception:
+            msg = escape_markdown(
+                "Could not parse your event choice. Please use the format from the buttons or 'All Events'. Use /cancel to stop.",
+                version=2,
+            )
+            await update.message.reply_text(
+                msg,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            if "addresses_to_investigate" in context.user_data:
+                del context.user_data["addresses_to_investigate"]
+            return ConversationHandler.END
+
+    if not selected_event_keys:
+        msg = escape_markdown(
+            "No valid events selected. Please start over with /getstats.", version=2
+        )
+        await update.message.reply_text(
+            msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=ReplyKeyboardRemove()
+        )
+        if "addresses_to_investigate" in context.user_data:
+            del context.user_data["addresses_to_investigate"]
+        return ConversationHandler.END
+
+    context.user_data["selected_event_keys"] = selected_event_keys
+    logger.info(f"User {user_id}: Stored selected_event_keys: {selected_event_keys}")
+
+    duration_options = [f"{i} day{'s' if i > 1 else ''}" for i in range(1, 8)]
+    reply_keyboard_duration = []
+    # Simple two-column layout for duration options
+    for i in range(0, len(duration_options), 2):
+        reply_keyboard_duration.append(duration_options[i : i + 2])
+
+    await update.message.reply_text(
+        "For how many past days do you want to fetch stats? (1-7 days)",
+        reply_markup=ReplyKeyboardMarkup(
+            reply_keyboard_duration,
+            one_time_keyboard=True,
+            input_field_placeholder="Select duration (e.g., '3 days')",
+        ),
+    )
+    return ASK_DURATION
+
+
+async def ask_duration_received(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Processes duration choice and fetches stats."""
+    user_id = update.effective_user.id if update.effective_user else "UnknownUser"
+    current_time_start_func = time.time()
+    logger.info(
+        f"User {user_id}: Entered ask_duration_received at {current_time_start_func:.4f}"
+    )
+
+    selected_duration_text = update.message.text
+    addresses_to_investigate = context.user_data.get("addresses_to_investigate")
+    selected_event_keys = context.user_data.get("selected_event_keys")
+
+    if not addresses_to_investigate or not selected_event_keys:
+        missing_data_parts = []
+        if not addresses_to_investigate:
+            missing_data_parts.append("address(es)")
+        if not selected_event_keys:
+            missing_data_parts.append("selected events")
+
+        logger.warning(
+            f"User {user_id}: Missing data in ask_duration_received: {', '.join(missing_data_parts)}."
+        )
+        error_msg = escape_markdown(
+            f"Something went wrong, I'm missing the {', '.join(missing_data_parts)}. Please start over with /getstats.",
+            version=2,
+        )
+        await update.message.reply_text(
+            error_msg,
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        # Clean up all potentially stored data
+        for key in ["addresses_to_investigate", "selected_event_keys", "duration_days"]:
+            if key in context.user_data:
+                del context.user_data[key]
+        return ConversationHandler.END
+
+    try:
+        # Parse duration_text like "3 days" to an integer 3
+        duration_days = int(selected_duration_text.split()[0])
+        if not (1 <= duration_days <= 7):
+            raise ValueError("Duration out of range")
+    except (ValueError, IndexError):
+        msg = escape_markdown(
+            "Invalid duration selected. Please choose a value between 1 and 7 days (e.g., '3 days'). Use /cancel to restart.",
+            version=2,
+        )
+        await update.message.reply_text(
+            msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=ReplyKeyboardRemove()
+        )
+        # Don't end conversation here, let them try duration again by returning ASK_DURATION
+        # However, it's simpler to end and ask to restart for now. If we wanted to re-ask,
+        # we would return ASK_DURATION and ensure the keyboard is reshown.
+        # For robustness, ending and clearing.
+        for key in [
+            "addresses_to_investigate",
+            "selected_event_keys",
+        ]:  # duration_days not yet set
+            if key in context.user_data:
+                del context.user_data[key]
+        return ConversationHandler.END  # Or return ASK_DURATION if we want to re-prompt
+
+    context.user_data["duration_days"] = duration_days
+    logger.info(
+        f"User {user_id}: Stored duration_days: {duration_days} for addresses {addresses_to_investigate} and events {selected_event_keys}"
+    )
+
     escaped_choice_for_fetching_msg = escape_markdown(
-        selected_event_choice_text, version=2
+        f"{duration_days} day{'s' if duration_days > 1 else ''} and events: {', '.join(selected_event_keys)}",
+        version=2,
     )
     num_addresses = len(addresses_to_investigate)
     address_plural = "address" if num_addresses == 1 else "addresses"
@@ -187,44 +323,7 @@ async def ask_events_received(
         f"User {user_id}: Sent 'Fetching stats...' message at {time_after_reply:.4f}. Reply took: {time_after_reply - time_before_reply:.4f}s"
     )
 
-    selected_event_keys = []
-    if selected_event_choice_text.lower() == "all events":
-        selected_event_keys = list(EVENT_CONFIGS.keys())
-    else:
-        # Try to parse the choice like "1. Hearted"
-        try:
-            key_from_choice = selected_event_choice_text.split(".")[0].strip()
-            if key_from_choice in EVENT_CONFIGS:
-                selected_event_keys = [key_from_choice]
-            else:
-                msg = escape_markdown(
-                    "Invalid event choice. Please try again or use /cancel.", version=2
-                )
-                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
-                if "addresses_to_investigate" in context.user_data:
-                    del context.user_data["addresses_to_investigate"]
-                return ConversationHandler.END
-        except Exception:
-            msg = escape_markdown(
-                "Could not parse your event choice. Please use the format from the buttons or 'All Events'. Use /cancel to stop.",
-                version=2,
-            )
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
-            if "addresses_to_investigate" in context.user_data:
-                del context.user_data["addresses_to_investigate"]
-            return ConversationHandler.END
-
-    if not selected_event_keys:
-        msg = escape_markdown(
-            "No valid events selected. Please start over with /getstats.", version=2
-        )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN_V2)
-        if "addresses_to_investigate" in context.user_data:
-            del context.user_data["addresses_to_investigate"]
-        return ConversationHandler.END
-
     try:
-        # Run the blocking function in a separate thread
         time_before_to_thread = time.time()
         logger.info(
             f"User {user_id}: Calling get_address_stats in a thread at {time_before_to_thread:.4f}. Time since func start: {time_before_to_thread - current_time_start_func:.4f}s"
@@ -234,6 +333,7 @@ async def ask_events_received(
             addresses_to_investigate,
             selected_event_keys,
             custom_rpc_urls=RPC_URLS,
+            duration_days=duration_days,
         )
         time_after_to_thread = time.time()
         logger.info(
@@ -253,7 +353,7 @@ async def ask_events_received(
         for address_item in addresses_to_investigate:
             escaped_current_address = escape_markdown(address_item, version=2)
             response_message_parts.append(
-                f"*Analysis for Address:* `{escaped_current_address}`\n"
+                f"*Analysis for Address:* `{escaped_current_address}` for the last {duration_days} day{'s' if duration_days > 1 else ''}\n"
             )
 
             if (
@@ -261,8 +361,6 @@ async def ask_events_received(
                 and all_analysis_results[address_item]
             ):
                 address_data = all_analysis_results[address_item]
-
-                # Use Rich to generate a plain text table with a box style that includes vertical lines
                 rich_text_table = RichTable(
                     box=RICH_BOX_STYLE,
                     show_header=True,
@@ -291,21 +389,14 @@ async def ask_events_received(
                         eth_str,
                         usd_str,
                     )
-
-                # Capture plain text output of the rich table
                 plain_table_io = io.StringIO()
-                # Corrected Console instantiation for plain text:
-                # No force_plain, ensure color_system is None (or not set, defaults to auto-detection which for a StringIO is usually no color)
-                # Set record=False explicitly as we are not exporting SVG/HTML.
                 console = RichConsole(
                     file=plain_table_io, record=False, color_system=None, width=80
-                )  # Adjust width if needed
+                )
                 console.print(rich_text_table)
                 plain_table_str = plain_table_io.getvalue()
                 plain_table_io.close()
-
                 safe_plain_table_str = plain_table_str.replace("```", "``·")
-
                 response_message_parts.append(
                     "```\n" + safe_plain_table_str.strip() + "\n```\n\n"
                 )
@@ -325,7 +416,6 @@ async def ask_events_received(
                 response_message_parts.append(f"- `{escaped_err}`\n")
 
         response_message = "".join(response_message_parts).strip()
-
         max_length = 4096
         ellipsis_md = escape_markdown("...", version=2)
         truncation_msg_text = "_Message truncated due to length._"
@@ -335,17 +425,14 @@ async def ask_events_received(
             safe_max_len_part1 = (
                 max_length - len(truncation_msg_md) - len(ellipsis_md) - 5
             )
-
             part1 = (
                 response_message[:safe_max_len_part1] if safe_max_len_part1 > 0 else ""
             )
             last_newline_idx = part1.rfind("\n")
             if last_newline_idx != -1:
                 part1 = part1[:last_newline_idx]
-
             if not part1.strip() and response_message.strip():
                 part1 = escape_markdown(response_message[:100], version=2)
-
             final_part1_text = part1
             if part1.strip():
                 final_part1_text += f"\n{ellipsis_md}"
@@ -353,7 +440,6 @@ async def ask_events_received(
                 final_part1_text = ellipsis_md
             else:
                 final_part1_text = ""
-
             if final_part1_text.strip():
                 await update.message.reply_text(
                     final_part1_text, parse_mode=ParseMode.MARKDOWN_V2
@@ -383,10 +469,10 @@ async def ask_events_received(
             escape_markdown(error_message_text, version=2),
             parse_mode=ParseMode.MARKDOWN_V2,
         )
-
     finally:
-        if "addresses_to_investigate" in context.user_data:
-            del context.user_data["addresses_to_investigate"]
+        for key in ["addresses_to_investigate", "selected_event_keys", "duration_days"]:
+            if key in context.user_data:
+                del context.user_data[key]
         return ConversationHandler.END
 
 
@@ -397,8 +483,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info(
         f"User {user_id} ({user.first_name if user else 'N/A'}) canceled the conversation."
     )
-    if "addresses_to_investigate" in context.user_data:
-        del context.user_data["addresses_to_investigate"]
+    # Clear all relevant user_data fields
+    for key in ["addresses_to_investigate", "selected_event_keys", "duration_days"]:
+        if key in context.user_data:
+            del context.user_data[key]
 
     cancel_text = escape_markdown("Operation cancelled.", version=2)
     await update.message.reply_text(
@@ -418,11 +506,9 @@ def main() -> None:
         logger.error(
             "RPC_URLS are not set in the environment variables. The bot may not function correctly."
         )
-        # Optionally, you could prevent the bot from starting if RPCs are critical.
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Add conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("getstats", getstats_start)],
         states={
@@ -432,9 +518,12 @@ def main() -> None:
             ASK_EVENTS: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, ask_events_received)
             ],
+            ASK_DURATION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_duration_received)
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,  # Ensures that we don't restart the conversation on every message if not expected
+        per_message=False,
     )
 
     application.add_handler(CommandHandler("start", start))

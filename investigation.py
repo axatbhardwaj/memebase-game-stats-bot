@@ -24,6 +24,8 @@ RPC_URLS = [
 CONTRACT_ADDRESS = "0x82A9c823332518c32a0c0eDC050Ef00934Cf04D4"
 # ADDRESS_TO_INVESTIGATE = "0x39FCE6a33596b7319d7941F3F90d256574bcc954"
 DEFAULT_MAX_RETRIES = 3  # Max retries for fetching a single chunk
+BASE_BLOCKS_PER_DAY = 43200  # Approx. blocks in a day on Base (2s block time)
+MAX_BLOCK_RANGE_PER_REQUEST = 500  # Max blocks per RPC request (e.g., Alchemy limit)
 
 # Map event names to their respective address and amount arguments in the ABI
 EVENT_CONFIGS = {
@@ -316,21 +318,20 @@ def fetch_eth_to_usd_rate():
             return None
 
 
-# Define the total range and chunk size based on the problem statement
-TOTAL_BLOCKS_TO_FETCH = 43200  # on base blockchain 1 day = 43200 blocks
-MAX_BLOCK_RANGE_PER_REQUEST = 500  # Alchemy's 500 block limit
-
-
 def get_address_stats(
-    addresses_to_investigate_list, selected_event_keys_list, custom_rpc_urls=None
+    addresses_to_investigate_list,
+    selected_event_keys_list,
+    custom_rpc_urls=None,
+    duration_days=7,  # Added duration_days with a default (can be overridden)
 ):
     """
-    Fetches and analyzes event logs for specified addresses and events.
+    Fetches and analyzes event logs for specified addresses and events for a given duration.
 
     Args:
         addresses_to_investigate_list (list): List of Ethereum addresses (strings).
         selected_event_keys_list (list): List of event keys (e.g., "1", "2") from EVENT_CONFIGS.
         custom_rpc_urls (list, optional): List of RPC URLs to use. Defaults to global RPC_URLS.
+        duration_days (int, optional): Number of past days to fetch stats for (1-7). Defaults to 7.
 
     Returns:
         tuple: (all_analysis_results, eth_to_usd_rate, errors)
@@ -385,26 +386,35 @@ def get_address_stats(
     if eth_to_usd_rate is None:
         errors.append("Failed to fetch ETH to USD rate. USD values will be N/A.")
 
-    # Determine the overall block range for investigation
     try:
-        current_block_number = w3.eth.block_number
-        # end_block_overall = current_block_number # Use actual current block for most up-to-date
-        end_block_overall = (
-            31589310  # Using fixed for consistency during dev, change as needed
-        )
-        start_block_overall = max(0, end_block_overall - TOTAL_BLOCKS_TO_FETCH)
+        # current_block_number = w3.eth.block_number # For most up-to-date
+        # For development consistency, using a fixed recent block. Replace with w3.eth.block_number for live data.
+        # end_block_overall = current_block_number
+        end_block_overall = 31589310  # Example: A recent block number from Base, update as needed or use live.
+
+        # Calculate total blocks to fetch based on duration_days
+        if not (1 <= duration_days <= 7):
+            print(
+                f"Warning: duration_days ({duration_days}) is outside the expected 1-7 range. Defaulting to 7 days."
+            )
+            errors.append(
+                f"Invalid duration_days ({duration_days}) received, defaulted to 7."
+            )
+            duration_days = 7  # Default to 7 if out of expected range
+
+        total_blocks_for_duration = duration_days * BASE_BLOCKS_PER_DAY
+        start_block_overall = max(0, end_block_overall - total_blocks_for_duration)
+
         print(
-            f"Log investigation range: block {start_block_overall} to {end_block_overall} (total {end_block_overall - start_block_overall + 1} blocks)"
+            f"Log investigation range for {duration_days} day(s): block {start_block_overall} to {end_block_overall} (total {end_block_overall - start_block_overall + 1} blocks)"
         )
     except Exception as e:
-        error_msg = (
-            f"Failed to get current block number: {e}. Cannot determine block range."
-        )
+        error_msg = f"Failed to determine block range: {e}."
         errors.append(error_msg)
         print(error_msg)
         return {}, eth_to_usd_rate, errors
 
-    if not contract:  # Double check contract after RPC and w3 setup
+    if not contract:
         error_msg = "Contract object is not initialized. Cannot fetch logs."
         errors.append(error_msg)
         print(error_msg)
@@ -418,25 +428,21 @@ def get_address_stats(
             amount_arg = event_info["amount_arg"]
 
             print(f"--- Fetching {event_name} Logs ---")
-            # Pass the globally managed (and potentially updated) contract object
             logs = fetch_event_logs_in_chunks(
-                contract,  # Use the module-level contract object
+                contract,
                 event_name,
                 start_block_overall,
                 end_block_overall,
                 MAX_BLOCK_RANGE_PER_REQUEST,
-                healthy_rpc_urls,  # Use the confirmed healthy RPCs
+                healthy_rpc_urls,
             )
 
             if not logs:
                 print(
-                    f"No logs found for {event_name}. It's possible there were no such events in the range, or an error occurred."
+                    f"No logs found for {event_name} in the range {start_block_overall}-{end_block_overall}."
                 )
-                # We can add an error to the list if logs is None, indicating a fetch problem
-                # If logs is an empty list, it means successful fetch but no events.
 
             for address in addresses_to_investigate_list:
-                # Ensure address entry exists in results
                 if address not in all_analysis_results:
                     all_analysis_results[address] = {}
 
@@ -444,9 +450,7 @@ def get_address_stats(
                     logs, address, event_arg, amount_arg
                 )
 
-                eth_amount = (
-                    analysis_results["total_amount"] / 10**18
-                )  # Assuming 18 decimals
+                eth_amount = analysis_results["total_amount"] / 10**18
                 usd_value = None
                 if eth_to_usd_rate is not None:
                     usd_value = eth_amount * eth_to_usd_rate
