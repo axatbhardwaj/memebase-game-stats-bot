@@ -44,12 +44,103 @@ from investigation import get_address_stats, EVENT_CONFIGS
 ASK_ADDRESS, ASK_EVENTS, ASK_DURATION = range(3)
 
 
+def format_results_for_telegram(all_results, eth_rate, addresses, events, duration):
+    """Formats the analysis results into a Markdown V2 string for Telegram."""
+
+    # Event emojis for a bit of flair
+    event_emojis = {
+        "Hearted": "❤️",
+        "Collected": "💰",
+        "Summoned": "✨",
+        "Unleashed": "🚀",
+        "Purged": "🔥",
+    }
+
+    # Main title
+    # Escape user-provided content once at the beginning
+    addresses_str = ", ".join([f"`{escape_markdown(a, version=2)}`" for a in addresses])
+    events_str = escape_markdown(events, version=2)
+    duration_str = escape_markdown(str(duration), version=2)
+
+    # Note on the ETH rate
+    if eth_rate is not None:
+        rate_str = f"*Current ETH to USD Rate:* `${escape_markdown(f'{eth_rate:,.2f}', version=2)}`"
+    else:
+        rate_str = "*ETH to USD Rate:* `Not Available`"
+
+    # Header for the results block
+    response_parts = [
+        f"📊 *Memebase Stats*",
+        f"\\- *Addresses:* {addresses_str}",
+        f"\\- *Events:* {events_str}",
+        f"\\- *Duration:* {duration_str} day\\(s\\)",
+        rate_str,
+        "\\- \\- \\- \\- \\- \\- \\- \\- \\- \\- \\- \\-",
+    ]
+
+    if not all_results:
+        response_parts.append("\n*No data found for the selected criteria\\.*")
+        return "\n".join(response_parts)
+
+    for address, events_data in all_results.items():
+        response_parts.append(f"\n*Address:* `{escape_markdown(address, version=2)}`")
+
+        if not events_data:
+            response_parts.append("\n_No activity found for this address\\._")
+            continue
+
+        for event_name, data in events_data.items():
+            count = data.get("count", 0)
+            emoji = event_emojis.get(event_name, "🔹")
+
+            # Event Title with emoji and a newline for separation
+            event_title = f"\n{emoji} *{escape_markdown(event_name, version=2)}*"
+            response_parts.append(event_title)
+
+            # Details are indented
+            count_str = escape_markdown(str(count), version=2)
+            response_parts.append(f"  `Count:` {count_str}")
+
+            if count > 0:
+                # Handle ETH value
+                if data.get("total_amount_eth", 0) > 0:
+                    eth_amount = data["total_amount_eth"] / 10**18
+                    eth_str = f"{eth_amount:.6f}"
+                    line = f"  `Total ETH:` `{escape_markdown(eth_str, version=2)}`"
+                    if eth_rate is not None:
+                        usd_value = eth_amount * eth_rate
+                        # Using ≈ for approximate value
+                        usd_str = f"\\(≈ ${escape_markdown(f'{usd_value:,.2f}', version=2)} USD\\)"
+                        line += f" {usd_str}"
+                    response_parts.append(line)
+
+                # Handle token values
+                if data.get("tokens"):
+                    response_parts.append("  `Tokens:`")
+                    for token_addr, amount in data["tokens"].items():
+                        # Assuming 18 decimals for all tokens for simplicity
+                        amount_normalized = amount / 10**18
+                        amount_str = f"{amount_normalized:,.4f}"
+                        token_addr_str = escape_markdown(token_addr, version=2)
+                        line = f"    \\- `{token_addr_str}`: `{escape_markdown(amount_str, version=2)}`"
+                        response_parts.append(line)
+
+    full_response = "\n".join(response_parts)
+
+    # Telegram has a message length limit of 4096 characters
+    if len(full_response) > 4096:
+        warning = "\n\n*Warning:* Output was truncated because it exceeded Telegram's message length limit\\."
+        return full_response[: (4096 - len(warning))] + warning
+
+    return full_response
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_message = (
         "Welcome to the Memebase Game Stats Bot!\n\n"
         "This bot fetches on-chain event statistics for the Memebase contract on the Base network. "
         "It analyzes events such as Hearted, Collected, Summoned, Unleashed, and Purged.\n\n"
-        "�� The data presented can be filtered for the last 1 to 7 days of blockchain activity.\n\n"
+        "The data presented can be filtered for the last 1 to 7 days of blockchain activity.\n\n"
         "To get started, use the /getstats command. You can provide a single Ethereum address or multiple addresses separated by commas."
     )
     await update.message.reply_text(welcome_message)
@@ -263,217 +354,99 @@ async def ask_duration_received(
                 del context.user_data[key]
         return ConversationHandler.END
 
-    try:
-        # Parse duration_text like "3 days" to an integer 3
-        duration_days = int(selected_duration_text.split()[0])
-        if not (1 <= duration_days <= 7):
-            raise ValueError("Duration out of range")
-    except (ValueError, IndexError):
-        msg = escape_markdown(
-            "Invalid duration selected. Please choose a value between 1 and 7 days (e.g., '3 days'). Use /cancel to restart.",
-            version=2,
-        )
+    if not is_valid_duration(selected_duration_text):
         await update.message.reply_text(
-            msg, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=ReplyKeyboardRemove()
+            "Invalid duration. Please select one of the buttons (e.g., '3 days') or use /cancel.",
+            reply_markup=ReplyKeyboardRemove(),
         )
-        # Don't end conversation here, let them try duration again by returning ASK_DURATION
-        # However, it's simpler to end and ask to restart for now. If we wanted to re-ask,
-        # we would return ASK_DURATION and ensure the keyboard is reshown.
-        # For robustness, ending and clearing.
-        for key in [
-            "addresses_to_investigate",
-            "selected_event_keys",
-        ]:  # duration_days not yet set
-            if key in context.user_data:
-                del context.user_data[key]
-        return ConversationHandler.END  # Or return ASK_DURATION if we want to re-prompt
+        return ASK_DURATION  # Ask again
 
+    duration_days = is_valid_duration(selected_duration_text)
     context.user_data["duration_days"] = duration_days
-    logger.info(
-        f"User {user_id}: Stored duration_days: {duration_days} for addresses {addresses_to_investigate} and events {selected_event_keys}"
-    )
-
-    escaped_choice_for_fetching_msg = escape_markdown(
-        f"{duration_days} day{'s' if duration_days > 1 else ''} and events: {', '.join(selected_event_keys)}",
-        version=2,
-    )
-    num_addresses = len(addresses_to_investigate)
-    address_plural = "address" if num_addresses == 1 else "addresses"
-
-    fetching_text_intro = escape_markdown(
-        f"Fetching stats for {num_addresses} {address_plural} concerning ", version=2
-    )
-    fetching_text_choice = f"`'{escaped_choice_for_fetching_msg}'`"
-    fetching_text_suffix = escape_markdown(
-        "... Please wait, this may take a moment.", version=2
-    )
-    fetching_text = fetching_text_intro + fetching_text_choice + fetching_text_suffix
-
-    time_before_reply = time.time()
-    logger.info(
-        f"User {user_id}: About to send 'Fetching stats...' message at {time_before_reply:.4f}. Time since func start: {time_before_reply - current_time_start_func:.4f}s"
-    )
-    await update.message.reply_text(
-        fetching_text,
-        reply_markup=ReplyKeyboardRemove(),
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
-    time_after_reply = time.time()
-    logger.info(
-        f"User {user_id}: Sent 'Fetching stats...' message at {time_after_reply:.4f}. Reply took: {time_after_reply - time_before_reply:.4f}s"
-    )
 
     try:
-        time_before_to_thread = time.time()
-        logger.info(
-            f"User {user_id}: Calling get_address_stats in a thread at {time_before_to_thread:.4f}. Time since func start: {time_before_to_thread - current_time_start_func:.4f}s"
+        await update.message.reply_text(
+            "Fetching your stats, this might take a moment...",
+            reply_markup=ReplyKeyboardRemove(),
         )
-        all_analysis_results, eth_to_usd_rate, errors = await asyncio.to_thread(
+
+        loop = asyncio.get_running_loop()
+        start_time_stats = time.time()
+
+        # Run the synchronous function in a separate thread
+        all_analysis_results, eth_to_usd_rate, errors = await loop.run_in_executor(
+            None,  # Use the default ThreadPoolExecutor
             get_address_stats,
             addresses_to_investigate,
             selected_event_keys,
-            custom_rpc_urls=RPC_URLS,
-            duration_days=duration_days,
+            RPC_URLS,
+            duration_days,
         )
-        time_after_to_thread = time.time()
+        end_time_stats = time.time()
         logger.info(
-            f"User {user_id}: get_address_stats call (awaited) completed at {time_after_to_thread:.4f}. Duration in thread (from this perspective): {time_after_to_thread - time_before_to_thread:.4f}s"
+            f"User {user_id}: get_address_stats call (awaited) completed at {end_time_stats:.4f}. Duration in thread (from this perspective): {end_time_stats - start_time_stats:.4f}s"
         )
-
-        response_message_parts = []
-
-        if eth_to_usd_rate is not None:
-            rate_str = escape_markdown(f"{eth_to_usd_rate:.2f}", version=2)
-            response_message_parts.append(f"_Current ETH to USD Rate: ${rate_str}_\n\n")
-        else:
-            response_message_parts.append(
-                escape_markdown("_ETH to USD rate not available._", version=2) + "\n\n"
-            )
-
-        for address_item in addresses_to_investigate:
-            escaped_current_address = escape_markdown(address_item, version=2)
-            response_message_parts.append(
-                f"*Analysis for Address:* `{escaped_current_address}` for the last {duration_days} day{'s' if duration_days > 1 else ''}\n"
-            )
-
-            if (
-                address_item in all_analysis_results
-                and all_analysis_results[address_item]
-            ):
-                address_data = all_analysis_results[address_item]
-                rich_text_table = RichTable(
-                    box=RICH_BOX_STYLE,
-                    show_header=True,
-                    show_lines=True,
-                    padding=(0, 1),
-                    title_style="",
-                    header_style="",
-                )
-                rich_text_table.add_column(
-                    "Event", justify="left", min_width=12, overflow="fold"
-                )
-                rich_text_table.add_column("Count", justify="right")
-                rich_text_table.add_column("Total ETH", justify="right")
-                rich_text_table.add_column("Total USD", justify="right")
-
-                for event_name_from_results, data in address_data.items():
-                    eth_str = f"{data['total_amount_eth']:.6f}"
-                    usd_str = (
-                        f"${data['total_amount_usd']:.2f}"
-                        if data["total_amount_usd"] is not None
-                        else "N/A"
-                    )
-                    rich_text_table.add_row(
-                        str(event_name_from_results),
-                        str(data["count"]),
-                        eth_str,
-                        usd_str,
-                    )
-                plain_table_io = io.StringIO()
-                console = RichConsole(
-                    file=plain_table_io, record=False, color_system=None, width=80
-                )
-                console.print(rich_text_table)
-                plain_table_str = plain_table_io.getvalue()
-                plain_table_io.close()
-                safe_plain_table_str = plain_table_str.replace("```", "``·")
-                response_message_parts.append(
-                    "```\n" + safe_plain_table_str.strip() + "\n```\n\n"
-                )
-            else:
-                no_data_msg = escape_markdown(
-                    "  No specific event data found for this address with the selected criteria.",
-                    version=2,
-                )
-                response_message_parts.append(no_data_msg + "\n\n")
 
         if errors:
-            response_message_parts.append(
-                escape_markdown("*Notices/Errors during analysis:*", version=2) + "\n"
+            error_message = "Encountered some issues during the process:\n" + "\n".join(
+                [f"- {escape_markdown(e, version=2)}" for e in errors]
             )
-            for err in errors:
-                escaped_err = escape_markdown(str(err), version=2)
-                response_message_parts.append(f"- `{escaped_err}`\n")
+            await update.message.reply_text(
+                error_message, parse_mode=ParseMode.MARKDOWN_V2
+            )
 
-        response_message = "".join(response_message_parts).strip()
-        max_length = 4096
-        ellipsis_md = escape_markdown("...", version=2)
-        truncation_msg_text = "_Message truncated due to length._"
-        truncation_msg_md = escape_markdown(truncation_msg_text, version=2)
+        # Use the new formatting function
+        selected_event_names = (
+            "All Events"
+            if len(selected_event_keys) == len(EVENT_CONFIGS)
+            else ", ".join(
+                [
+                    EVENT_CONFIGS[key]["name"]
+                    for key in selected_event_keys
+                    if key in EVENT_CONFIGS
+                ]
+            )
+        )
 
-        if len(response_message) > max_length:
-            safe_max_len_part1 = (
-                max_length - len(truncation_msg_md) - len(ellipsis_md) - 5
-            )
-            part1 = (
-                response_message[:safe_max_len_part1] if safe_max_len_part1 > 0 else ""
-            )
-            last_newline_idx = part1.rfind("\n")
-            if last_newline_idx != -1:
-                part1 = part1[:last_newline_idx]
-            if not part1.strip() and response_message.strip():
-                part1 = escape_markdown(response_message[:100], version=2)
-            final_part1_text = part1
-            if part1.strip():
-                final_part1_text += f"\n{ellipsis_md}"
-            elif response_message.strip():
-                final_part1_text = ellipsis_md
-            else:
-                final_part1_text = ""
-            if final_part1_text.strip():
-                await update.message.reply_text(
-                    final_part1_text, parse_mode=ParseMode.MARKDOWN_V2
-                )
-            await update.message.reply_text(
-                truncation_msg_md, parse_mode=ParseMode.MARKDOWN_V2
-            )
-        elif response_message.strip():
-            await update.message.reply_text(
-                response_message, parse_mode=ParseMode.MARKDOWN_V2
-            )
-        else:
-            await update.message.reply_text(
-                escape_markdown(
-                    "No information to display based on your query.", version=2
-                ),
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
+        response_message = format_results_for_telegram(
+            all_analysis_results,
+            eth_to_usd_rate,
+            addresses_to_investigate,
+            selected_event_names,
+            duration_days,
+        )
+
+        await update.message.reply_text(
+            response_message, parse_mode=ParseMode.MARKDOWN_V2
+        )
 
     except Exception as e:
         logger.error(
             f"User {user_id}: Error during stats fetching or processing for addresses: {addresses_to_investigate}: {e}",
-            exc_info=True,
+            exc_info=True,  # Log the full traceback
         )
-        error_message_text = f"An unexpected error occurred while processing your request. Please try again later or contact support."
         await update.message.reply_text(
-            escape_markdown(error_message_text, version=2),
-            parse_mode=ParseMode.MARKDOWN_V2,
+            "An unexpected error occurred. Please try again or use /cancel."
         )
+
     finally:
-        for key in ["addresses_to_investigate", "selected_event_keys", "duration_days"]:
-            if key in context.user_data:
-                del context.user_data[key]
-        return ConversationHandler.END
+        # Clean up user_data after the conversation ends
+        if "addresses_to_investigate" in context.user_data:
+            del context.user_data["addresses_to_investigate"]
+        if "selected_event_keys" in context.user_data:
+            del context.user_data["selected_event_keys"]
+    return ConversationHandler.END
+
+
+def is_valid_duration(text: str) -> int | None:
+    try:
+        duration_days = int(text.split()[0])
+        if 1 <= duration_days <= 7:
+            return duration_days
+        else:
+            return None
+    except (ValueError, IndexError):
+        return None
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
