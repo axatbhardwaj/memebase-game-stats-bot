@@ -29,15 +29,38 @@ MAX_BLOCK_RANGE_PER_REQUEST = 500  # Max blocks per RPC request (e.g., Alchemy l
 
 # Map event names to their respective address and amount arguments in the ABI
 EVENT_CONFIGS = {
-    "1": {"name": "Hearted", "event_arg": "hearter", "amount_arg": "amount"},
-    "2": {"name": "Collected", "event_arg": "hearter", "amount_arg": "allocation"},
-    "3": {"name": "Summoned", "event_arg": "summoner", "amount_arg": "amount"},
-    "4": {"name": "Unleashed", "event_arg": "unleasher", "amount_arg": "liquidity"},
+    "1": {
+        "name": "Hearted",
+        "event_arg": "hearter",
+        "amount_arg": "amount",
+        "type": "eth_value",
+    },
+    "2": {
+        "name": "Collected",
+        "event_arg": "hearter",
+        "amount_arg": "allocation",
+        "type": "token_value",
+        "token_arg": "memeToken",
+    },
+    "3": {
+        "name": "Summoned",
+        "event_arg": "summoner",
+        "amount_arg": "amount",
+        "type": "eth_value",
+    },
+    "4": {
+        "name": "Unleashed",
+        "event_arg": "unleasher",
+        "amount_arg": "liquidity",
+        "type": "eth_value",
+    },
     "5": {
         "name": "Purged",
-        "event_arg": "memeToken",
+        "event_arg": None,  # For Purged, we check the transaction 'from' address
         "amount_arg": "amount",
-    },  # memeToken is the token address here
+        "type": "token_value",
+        "token_arg": "memeToken",
+    },
 }
 
 # --- Load ABI ---
@@ -282,19 +305,88 @@ def fetch_event_logs_in_chunks(
     return all_logs
 
 
-def analyze_event_logs(logs, address_to_find, event_arg, amount_arg):
+def analyze_event_logs(logs, address_to_find, event_config, w3_instance, contract_abi):
     """
-    Counts how many times a specific address has 'hearted' and the total amount.
+    Analyzes event logs for a specific address.
+    Handles both direct ETH value events and token value events.
+    For 'Purged' events, it inspects the transaction sender.
     """
-    count = 0
-    total_amount = 0
-    # Ensure the address to find is checksummed for accurate comparison
+    results = {"count": 0, "total_amount_eth": 0, "tokens": {}}
     checksum_address_to_find = Web3.to_checksum_address(address_to_find)
+    event_type = event_config.get("type", "eth_value")
+    event_arg = event_config.get("event_arg")
+    amount_arg = event_config["amount_arg"]
+    token_arg = event_config.get("token_arg")
+    event_name = event_config["name"]
+
+    # Create a decoder for logs if needed (for Purged event processing)
+    # This is a simplified way to get the event signature for filtering
+    contract_for_decode = w3_instance.eth.contract(abi=contract_abi)
+    event_abi = next(
+        (item for item in contract_abi if item.get("name") == event_name), None
+    )
+    if not event_abi:
+        return results  # Should not happen if EVENT_CONFIGS is correct
+
+    processed_txs = set()
+
     for log in logs:
-        if getattr(log.args, event_arg) == checksum_address_to_find:
-            count += 1
-            total_amount += getattr(log.args, amount_arg)
-    return {"count": count, "total_amount": total_amount}
+        user_address_in_log = None
+        # Case 1: Event argument directly identifies the user (e.g., Hearted, Collected)
+        if event_arg:
+            user_address_in_log = getattr(log.args, event_arg, None)
+            if user_address_in_log != checksum_address_to_find:
+                continue  # Log is not for the address we're looking for
+
+        # Case 2: We need to find the user from the transaction sender (for Purged)
+        else:
+            tx_hash = log.transactionHash.hex()
+            if tx_hash in processed_txs:
+                continue
+            try:
+                tx = w3_instance.eth.get_transaction(tx_hash)
+                if tx["from"] != checksum_address_to_find:
+                    continue  # This transaction was not sent by our user
+                # Since we check all logs from this tx now, we can skip it later
+                processed_txs.add(tx_hash)
+
+                # For sender-based events, we need to re-process all logs in the receipt
+                # to correctly attribute events within that transaction.
+                receipt = w3_instance.eth.get_transaction_receipt(tx_hash)
+                # Filter for the specific event logs (e.g., Purged) initiated by our user
+                relevant_logs_in_tx = contract_for_decode.events[
+                    event_name
+                ]().process_receipt(receipt)
+
+                for inner_log in relevant_logs_in_tx:
+                    results["count"] += 1
+                    amount = getattr(inner_log.args, amount_arg)
+                    token_address = getattr(inner_log.args, token_arg)
+                    # Normalize to checksum address for consistent keys
+                    token_address_checksum = Web3.to_checksum_address(token_address)
+                    results["tokens"][token_address_checksum] = (
+                        results["tokens"].get(token_address_checksum, 0) + amount
+                    )
+                continue  # Continue to the next log in the main loop
+
+            except Exception:
+                # Silently ignore transactions that can't be fetched, or log if needed
+                continue
+
+        # This part runs for events that are not sender-based (i.e., have event_arg)
+        results["count"] += 1
+        amount = getattr(log.args, amount_arg)
+
+        if event_type == "eth_value":
+            results["total_amount_eth"] += amount
+        elif event_type == "token_value" and token_arg:
+            token_address = getattr(log.args, token_arg)
+            token_address_checksum = Web3.to_checksum_address(token_address)
+            results["tokens"][token_address_checksum] = (
+                results["tokens"].get(token_address_checksum, 0) + amount
+            )
+
+    return results
 
 
 def fetch_eth_to_usd_rate():
@@ -424,8 +516,6 @@ def get_address_stats(
         if event_key in EVENT_CONFIGS:
             event_info = EVENT_CONFIGS[event_key]
             event_name = event_info["name"]
-            event_arg = event_info["event_arg"]
-            amount_arg = event_info["amount_arg"]
 
             print(f"--- Fetching {event_name} Logs ---")
             logs = fetch_event_logs_in_chunks(
@@ -446,26 +536,75 @@ def get_address_stats(
                 if address not in all_analysis_results:
                     all_analysis_results[address] = {}
 
+                # Pass the w3 instance and contract ABI for more detailed analysis
                 analysis_results = analyze_event_logs(
-                    logs, address, event_arg, amount_arg
+                    logs, address, event_info, w3, ABI
                 )
 
-                eth_amount = analysis_results["total_amount"] / 10**18
-                usd_value = None
-                if eth_to_usd_rate is not None:
-                    usd_value = eth_amount * eth_to_usd_rate
-
-                all_analysis_results[address][event_name] = {
-                    "count": analysis_results["count"],
-                    "total_amount_eth": eth_amount,
-                    "total_amount_usd": usd_value,
-                }
+                # Store raw results; formatting happens at the presentation layer
+                all_analysis_results[address][event_name] = analysis_results
         else:
             warn_msg = f"Warning: Invalid event selection: {event_key}. Skipping."
             print(warn_msg)
             errors.append(warn_msg)
 
     return all_analysis_results, eth_to_usd_rate, errors
+
+
+def format_and_display_results(all_analysis_results, eth_to_usd_rate):
+    """Formats the raw analysis data into a human-readable table."""
+    console = Console()
+    console.print("\n--- Analysis Results ---")
+
+    if not all_analysis_results:
+        console.print("No analysis results to display.")
+        return
+
+    for address, events_data in all_analysis_results.items():
+        table = Table(
+            title=f"Results for Address: {address}",
+            show_lines=True,
+            title_style="bold magenta",
+        )
+
+        table.add_column("Event", style="cyan", no_wrap=False)
+        table.add_column("Count", style="magenta", justify="center")
+        table.add_column("Details", style="green", justify="left")
+
+        for event_name, data in events_data.items():
+            count_str = str(data["count"])
+            details_str = ""
+
+            if data.get("total_amount_eth", 0) > 0:
+                eth_amount = data["total_amount_eth"] / 10**18
+                details_str += f"Total ETH: {eth_amount:.6f}"
+                usd_value = None
+                if eth_to_usd_rate is not None:
+                    usd_value = eth_amount * eth_to_usd_rate
+                    if usd_value is not None:
+                        details_str += f" (~${usd_value:,.2f} USD)"
+
+            if data.get("tokens"):
+                token_lines = []
+                for token_addr, amount in data["tokens"].items():
+                    # Here, you could add a call to get token symbol and decimals for better display
+                    # For now, we'll show the amount in its raw format.
+                    amount_normalized = amount / 10**18  # Assuming 18 decimals
+                    token_lines.append(
+                        f"- {token_addr}: {amount_normalized:,.4f} tokens"
+                    )
+                if token_lines:
+                    if details_str:
+                        details_str += "\n"
+                    details_str += "\n".join(token_lines)
+
+            table.add_row(event_name, count_str, details_str if details_str else "N/A")
+
+        if not table.rows:
+            # This can happen if an address has events but no counted activities
+            table.add_row("No activity found for selected events.", "", "")
+
+        console.print(Align.center(table))
 
 
 # --- Original main execution block (commented out or removed) ---
